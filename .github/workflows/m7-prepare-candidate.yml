@@ -40,7 +40,8 @@ jobs:
           mkdir -p m6
           tar -xzf /tmp/m6-runtime.tar.gz -C m6
           test -f m6/src/aqp_publisher/publisher.py
-          test -f m6/tests/test_m6_publisher_dry_run.py
+          test -f m6/tests/m2_helpers.py
+          test -f m6/tests/m3_helpers.py
 
       - name: Checkout pinned Website baseline
         uses: actions/checkout@v4
@@ -60,25 +61,42 @@ jobs:
           set -euo pipefail
           mkdir -p m7-candidate
           PYTHONPATH="$GITHUB_WORKSPACE/m6/src:$GITHUB_WORKSPACE/m6" python - <<'PY'
-          import json, subprocess, tempfile
+          import json, subprocess
           from pathlib import Path
           from aqp_publisher.publisher import WebsiteBaseline, WebsitePublisherDryRunEngine
-          from tests.test_m6_publisher_dry_run import make_ops_repo
-          from tests.m3_helpers import current
+          from aqp_core.state_engine import StateTransitionEngine
+          from tests.m2_helpers import init_repo, base_manifest, materialize_computed_applicability, write_current_package, gate_record
+          from tests.m3_helpers import current, command, ingestion_command, init_git
 
-          root=Path.cwd(); site=root/'website'; out=root/'m7-candidate'
+          root=Path.cwd(); site=root/'website'; out=root/'m7-candidate'; m6=root/'m6'
           expected='98c72e343f35cca378436e8f764b235786c8a70d'
           actual=subprocess.check_output(['git','rev-parse','HEAD'],cwd=site,text=True).strip()
           assert actual==expected, (actual, expected)
-          ops, manifest = make_ops_repo(root/'synthetic-m7', 'story')
+
+          ops=init_repo(root/'synthetic-m7',m6)
+          manifest=base_manifest('story')
+          materialize_computed_applicability(ops,manifest)
+          write_current_package(ops,manifest)
+          init_git(ops)
+          e=StateTransitionEngine(ops); cid=manifest['content_id']
+          assert e.execute_transition(command(ops,cid,'IN_REVIEW','REVIEW_REQUESTED',command_id='M7-SYN-0')).accepted
+          _,w=current(ops,cid)
+          if w['current_state']=='IN_REVIEW':
+              assert e.execute_transition(command(ops,cid,'READY_FOR_PUBLISH_REVIEW','NON_FINAL_GATES_SATISFIED',role='SYSTEM',actor_type='SYSTEM',command_id='M7-SYN-1')).accepted
+          cur,_=current(ops,cid)
+          final=gate_record(cur,'final_publish','APPROVED','Founder',review_id='M7-SYN-FINAL')
+          fc=ingestion_command(ops,cid,role='Founder',actor_id=final['reviewed_by_id'],command_id='M7-SYN-2')
+          rr=e.ingest_gate_result(fc,final)
+          assert rr.accepted and rr.resulting_state=='APPROVED_FOR_PUBLISH'
+          manifest,_=current(ops,cid)
+
           engine=WebsitePublisherDryRunEngine(ops, WebsiteBaseline(site,'pitchu213-sys/ahla-qisas',expected,'main'))
           plan=engine.generate_plan(manifest['content_id'], expected_website_base_sha=expected)
           dry=engine.apply_and_validate(plan, install_timeout_seconds=900, build_timeout_seconds=900)
           validated=dry['validated_change_set']
-          assert dry['status']=='PASS'
-          assert dry['build']['status']=='PASS'
-          assert dry['route_validation']['status']=='PASS'
+          assert dry['status']=='PASS' and dry['build']['status']=='PASS' and dry['route_validation']['status']=='PASS'
           assert current(ops,manifest['content_id'])[1]['current_state']=='APPROVED_FOR_PUBLISH'
+
           (out/'candidate-plan.json').write_text(json.dumps(validated,ensure_ascii=False,indent=2),encoding='utf-8')
           (out/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
           source_rel=manifest['source_files'][0]['source_artifact']['path']
@@ -87,20 +105,7 @@ jobs:
           ops_head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ops,text=True).strip()
           (out/'ops-head.txt').write_text(ops_head+'\n',encoding='utf-8')
           subprocess.run(['git','bundle','create',str(out/'synthetic-ops.bundle'),'--all'],cwd=ops,check=True)
-          summary={
-            'm6_head':'b02bd7743504ef135aed68656f26e84c90cf5af0',
-            'website_sha':expected,
-            'ops_head':ops_head,
-            'content_id':manifest['content_id'],
-            'content_version':manifest['content_version'],
-            'content_hash':manifest['content_hash'],
-            'manifest_hash':manifest['manifest_hash'],
-            'route':validated['route'],
-            'branch':validated['branch_payload']['intended_branch_name'],
-            'changed_files':validated['branch_payload']['intended_changed_files'],
-            'build_status':dry['build']['status'],
-            'route_status':dry['route_validation']['status'],
-          }
+          summary={'m6_head':'b02bd7743504ef135aed68656f26e84c90cf5af0','website_sha':expected,'ops_head':ops_head,'content_id':manifest['content_id'],'content_version':manifest['content_version'],'content_hash':manifest['content_hash'],'manifest_hash':manifest['manifest_hash'],'route':validated['route'],'branch':validated['branch_payload']['intended_branch_name'],'changed_files':validated['branch_payload']['intended_changed_files'],'build_status':dry['build']['status'],'route_status':dry['route_validation']['status']}
           (out/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
           print(json.dumps(summary,indent=2))
           PY
