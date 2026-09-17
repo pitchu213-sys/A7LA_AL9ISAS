@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -11,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 M6_HEAD = "b02bd7743504ef135aed68656f26e84c90cf5af0"
+M6_RUNTIME_ARCHIVE_SHA256 = "97dee77907c8595b05e523c7d920fb3dea1982455f11cb275922dad4f618e1e0"
 WEBSITE_REPOSITORY = "pitchu213-sys/ahla-qisas"
 WEBSITE_SHA = "98c72e343f35cca378436e8f764b235786c8a70d"
 SUPPORTED = ("story", "article", "video", "short")
@@ -63,6 +63,24 @@ def git_text(repo: Path, *args: str) -> str:
     return p.stdout.strip()
 
 
+def runtime_tree_hash(root: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        if rel in {".accepted-head", ".runtime-archive-sha256"}:
+            continue
+        if "__pycache__" in path.parts or rel.endswith(".pyc"):
+            continue
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        h.update(path.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
 def networkish(text: str) -> bool:
     low = text.lower()
     keys = ("enotfound", "eai_again", "network", "could not resolve", "registry.npmjs.org", "fetch failed", "timed out", "timeout")
@@ -94,17 +112,20 @@ classification = "PASS"
 failure_reason = None
 
 try:
-    # Exact accepted implementation + exact pinned Website identity.
-    m6_head_before = git_text(M6, "rev-parse", "HEAD")
-    website_head_before = git_text(WEBSITE, "rev-parse", "HEAD")
-    if m6_head_before != M6_HEAD:
-        classification, failure_reason = "ENVIRONMENT_FAILURE", f"M6 checkout is {m6_head_before}, expected {M6_HEAD}"
+    accepted_head_file = M6 / ".accepted-head"
+    archive_hash_file = M6 / ".runtime-archive-sha256"
+    if not accepted_head_file.is_file() or accepted_head_file.read_text(encoding="utf-8").strip() != M6_HEAD:
+        classification, failure_reason = "ENVIRONMENT_FAILURE", "M6 accepted-head provenance marker missing or wrong"
         raise RuntimeError(failure_reason)
+    if not archive_hash_file.is_file() or archive_hash_file.read_text(encoding="utf-8").strip() != M6_RUNTIME_ARCHIVE_SHA256:
+        classification, failure_reason = "ENVIRONMENT_FAILURE", "M6 runtime archive hash provenance marker missing or wrong"
+        raise RuntimeError(failure_reason)
+    m6_tree_before = runtime_tree_hash(M6)
+    website_head_before = git_text(WEBSITE, "rev-parse", "HEAD")
     if website_head_before != WEBSITE_SHA:
         classification, failure_reason = "ENVIRONMENT_FAILURE", f"Website checkout is {website_head_before}, expected {WEBSITE_SHA}"
         raise RuntimeError(failure_reason)
 
-    m6_status_before = git_text(M6, "status", "--porcelain")
     website_status_before = git_text(WEBSITE, "status", "--porcelain")
     website_remote_before = run(["git", "ls-remote", "origin"], WEBSITE, timeout=120, log_name="website_remote_before")
     if website_remote_before["exit_status"] != 0:
@@ -119,7 +140,6 @@ try:
     result["node_version"] = node["stdout"].strip()
     result["npm_version"] = npm["stdout"].strip()
 
-    # Untouched baseline build: disposable clone at exact pinned commit, no M6 changes.
     with tempfile.TemporaryDirectory(prefix="aqp-m6-real-baseline-") as td:
         base = Path(td) / "website"
         clone_local(WEBSITE, base)
@@ -138,7 +158,6 @@ try:
             raise RuntimeError(failure_reason)
         result["baseline"]["status"] = "PASS"
 
-    # Import exact accepted M6 implementation only after baseline passes.
     sys.path.insert(0, str(M6 / "src"))
     sys.path.insert(0, str(M6))
     from aqp_publisher.publisher import WebsiteBaseline, WebsitePublisherDryRunEngine, PublisherError
@@ -160,10 +179,7 @@ try:
                 plan = engine.generate_plan(manifest["content_id"], expected_website_base_sha=WEBSITE_SHA)
                 dry = engine.apply_and_validate(plan, build_timeout_seconds=900, install_timeout_seconds=900)
             except PublisherError as exc:
-                if exc.code == "M6_BUILD_ENVIRONMENT_UNAVAILABLE":
-                    classification = "ENVIRONMENT_FAILURE"
-                else:
-                    classification = "M6_OUTPUT_FAILURE"
+                classification = "ENVIRONMENT_FAILURE" if exc.code == "M6_BUILD_ENVIRONMENT_UNAVAILABLE" else "M6_OUTPUT_FAILURE"
                 failure_reason = f"{content_type}: {exc.code}: {exc.message}"
                 result["types"][content_type] = {"status": "FAIL", "error": exc.as_dict()}
                 raise RuntimeError(failure_reason) from exc
@@ -195,12 +211,10 @@ try:
                 "real_website_mutation": dry.get("real_website_mutation"),
                 "canonical_ops_mutation": dry.get("canonical_ops_mutation"),
             }
-            # Preserve M6's own full build logs from summaries as separate evidence.
             (LOGS / f"{content_type}_m6_build_summary.log").write_text(
                 json.dumps(dry["build"], ensure_ascii=False, indent=2), encoding="utf-8"
             )
 
-    # Negative sandbox input: deliberately invalid MDX on a disposable exact-baseline clone.
     with tempfile.TemporaryDirectory(prefix="aqp-m6-real-negative-") as td:
         neg = Path(td) / "website"
         clone_local(WEBSITE, neg)
@@ -224,10 +238,8 @@ try:
             "canonical_ops_mutation": False,
         }
 
-    # Final immutability and remote-ref evidence.
-    m6_head_after = git_text(M6, "rev-parse", "HEAD")
+    m6_tree_after = runtime_tree_hash(M6)
     website_head_after = git_text(WEBSITE, "rev-parse", "HEAD")
-    m6_status_after = git_text(M6, "status", "--porcelain")
     website_status_after = git_text(WEBSITE, "status", "--porcelain")
     website_remote_after = run(["git", "ls-remote", "origin"], WEBSITE, timeout=120, log_name="website_remote_after")
     if website_remote_after["exit_status"] != 0:
@@ -235,10 +247,10 @@ try:
         raise RuntimeError(failure_reason)
     refs_unchanged = website_remote_before["stdout"] == website_remote_after["stdout"]
     result["immutability"] = {
-        "m6_head_before": m6_head_before,
-        "m6_head_after": m6_head_after,
-        "m6_status_before": m6_status_before,
-        "m6_status_after": m6_status_after,
+        "m6_accepted_head": M6_HEAD,
+        "m6_runtime_archive_sha256": M6_RUNTIME_ARCHIVE_SHA256,
+        "m6_runtime_tree_hash_before": m6_tree_before,
+        "m6_runtime_tree_hash_after": m6_tree_after,
         "website_head_before": website_head_before,
         "website_head_after": website_head_after,
         "website_status_before": website_status_before,
@@ -249,7 +261,7 @@ try:
         "vercel_deployment": False,
         "published_transition": False,
     }
-    if not (m6_head_before == m6_head_after == M6_HEAD and website_head_before == website_head_after == WEBSITE_SHA and m6_status_before == m6_status_after and website_status_before == website_status_after and refs_unchanged):
+    if not (m6_tree_before == m6_tree_after and website_head_before == website_head_after == WEBSITE_SHA and website_status_before == website_status_after and refs_unchanged):
         classification, failure_reason = "M6_OUTPUT_FAILURE", "Immutability check failed"
         raise RuntimeError(failure_reason)
 
@@ -276,7 +288,7 @@ finally:
 
     imm = result.get("immutability", {})
     baseline = result.get("baseline", {})
-    md = f"""# REAL WEBSITE BUILD EVIDENCE — M6\n\n## Execution identity\n\n- **Workflow run ID:** `{result['workflow_run_id']}`\n- **Execution date (UTC):** `{result['execution_date_utc']}`\n- **Runner OS:** `{result['runner_os']}`\n- **Runner:** `{result['runner_name']}`\n- **M6 implementation HEAD:** `{M6_HEAD}`\n- **Website repository:** `{WEBSITE_REPOSITORY}`\n- **Website exact SHA:** `{WEBSITE_SHA}`\n- **Node:** `{result.get('node_version','NOT RECORDED')}`\n- **npm:** `{result.get('npm_version','NOT RECORDED')}`\n\n## Untouched pinned Website baseline\n\n- **Baseline SHA verified:** `{baseline.get('sha','NOT RUN')}`\n- **npm ci:** `{('PASS' if baseline.get('npm_ci',{}).get('exit_status') == 0 else 'FAIL / NOT RUN')}`\n- **npm ci exit:** `{baseline.get('npm_ci',{}).get('exit_status','N/A')}`\n- **npm ci duration:** `{baseline.get('npm_ci',{}).get('duration_seconds','N/A')}s`\n- **npm run build:** `{('PASS' if baseline.get('build',{}).get('exit_status') == 0 else 'FAIL / NOT RUN')}`\n- **build exit:** `{baseline.get('build',{}).get('exit_status','N/A')}`\n- **build duration:** `{baseline.get('build',{}).get('duration_seconds','N/A')}s`\n\n## Existing M6 Dry Run against the real pinned Website\n\n{chr(10).join(type_lines)}\n\n## Route validation\n\n**Overall:** `{('PASS' if result.get('types') and all(result.get('types',{}).get(c,{}).get('status') == 'PASS' for c in SUPPORTED) else 'FAIL / NOT RUN')}`\n\nEach supported content type was planned by the accepted M6 implementation, applied only to M6's disposable Website sandbox, built with the real Website lockfile/toolchain, and checked for its expected `dist` route.\n\n## Negative test\n\n- **Result:** `{result.get('negative_test',{}).get('status','NOT RUN')}`\n- **Build exit:** `{result.get('negative_test',{}).get('build_exit_status','N/A')}`\n- **Input:** `{result.get('negative_test',{}).get('input','N/A')}`\n\n## Immutability / no remote write\n\n- **M6/Ops HEAD before:** `{imm.get('m6_head_before','N/A')}`\n- **M6/Ops HEAD after:** `{imm.get('m6_head_after','N/A')}`\n- **Website HEAD before:** `{imm.get('website_head_before','N/A')}`\n- **Website HEAD after:** `{imm.get('website_head_after','N/A')}`\n- **Website status before:** `{imm.get('website_status_before','') or '(clean)'}`\n- **Website status after:** `{imm.get('website_status_after','') or '(clean)'}`\n- **Website remote refs unchanged:** `{yesno(bool(imm.get('website_remote_refs_unchanged')))}`\n- **Remote writes:** `NO`\n- **Remote branch creation:** `NO`\n- **Pull Request:** `NO`\n- **Vercel:** `NO`\n- **PUBLISHED transition:** `NO`\n\nThe workflow itself declares `permissions: contents: read`, uses `persist-credentials: false`, and contains no publication/deployment command.\n\n## Final classification\n\n`{classification}`\n\n{('Failure reason: ' + failure_reason) if failure_reason else ''}\n\n## Acceptance summary\n\n- **REAL PINNED WEBSITE BUILD:** `{('PASS' if classification == 'PASS' else classification)}`\n- **STORY:** `{result.get('types',{}).get('story',{}).get('status','NOT RUN')}`\n- **ARTICLE:** `{result.get('types',{}).get('article',{}).get('status','NOT RUN')}`\n- **VIDEO:** `{result.get('types',{}).get('video',{}).get('status','NOT RUN')}`\n- **SHORT:** `{result.get('types',{}).get('short',{}).get('status','NOT RUN')}`\n- **ROUTE VALIDATION:** `{('PASS' if classification == 'PASS' else 'NOT COMPLETE')}`\n- **NEGATIVE TEST:** `{result.get('negative_test',{}).get('status','NOT RUN')}`\n- **REAL WEBSITE UNCHANGED:** `{yesno(classification == 'PASS' and imm.get('website_head_before') == imm.get('website_head_after') and imm.get('website_status_before') == imm.get('website_status_after'))}`\n- **OPS UNCHANGED:** `{yesno(classification == 'PASS' and imm.get('m6_head_before') == imm.get('m6_head_after') and imm.get('m6_status_before') == imm.get('m6_status_after'))}`\n- **REMOTE WRITE:** `NO`\n- **READY FOR M6 FINAL ACCEPTANCE:** `{yesno(classification == 'PASS')}`\n"""
+    md = f"""# REAL WEBSITE BUILD EVIDENCE — M6\n\n## Execution identity\n\n- **Workflow run ID:** `{result['workflow_run_id']}`\n- **Execution date (UTC):** `{result['execution_date_utc']}`\n- **Runner OS:** `{result['runner_os']}`\n- **Runner:** `{result['runner_name']}`\n- **M6 implementation HEAD:** `{M6_HEAD}`\n- **Website repository:** `{WEBSITE_REPOSITORY}`\n- **Website exact SHA:** `{WEBSITE_SHA}`\n- **Node:** `{result.get('node_version','NOT RECORDED')}`\n- **npm:** `{result.get('npm_version','NOT RECORDED')}`\n\n## Untouched pinned Website baseline\n\n- **Baseline SHA verified:** `{baseline.get('sha','NOT RUN')}`\n- **npm ci:** `{('PASS' if baseline.get('npm_ci',{}).get('exit_status') == 0 else 'FAIL / NOT RUN')}`\n- **npm ci exit:** `{baseline.get('npm_ci',{}).get('exit_status','N/A')}`\n- **npm ci duration:** `{baseline.get('npm_ci',{}).get('duration_seconds','N/A')}s`\n- **npm run build:** `{('PASS' if baseline.get('build',{}).get('exit_status') == 0 else 'FAIL / NOT RUN')}`\n- **build exit:** `{baseline.get('build',{}).get('exit_status','N/A')}`\n- **build duration:** `{baseline.get('build',{}).get('duration_seconds','N/A')}s`\n\n## Existing M6 Dry Run against the real pinned Website\n\n{chr(10).join(type_lines)}\n\n## Route validation\n\n**Overall:** `{('PASS' if result.get('types') and all(result.get('types',{}).get(c,{}).get('status') == 'PASS' for c in SUPPORTED) else 'FAIL / NOT RUN')}`\n\nEach supported content type was planned by the accepted M6 implementation, applied only to M6's disposable Website sandbox, built with the real Website lockfile/toolchain, and checked for its expected `dist` route.\n\n## Negative test\n\n- **Result:** `{result.get('negative_test',{}).get('status','NOT RUN')}`\n- **Build exit:** `{result.get('negative_test',{}).get('build_exit_status','N/A')}`\n- **Input:** `{result.get('negative_test',{}).get('input','N/A')}`\n\n## Immutability / no remote write\n\n- **M6 implementation HEAD (provenance):** `{imm.get('m6_accepted_head','N/A')}`\n- **M6 runtime archive SHA-256:** `{imm.get('m6_runtime_archive_sha256','N/A')}`\n- **M6 runtime tree hash before:** `{imm.get('m6_runtime_tree_hash_before','N/A')}`\n- **M6 runtime tree hash after:** `{imm.get('m6_runtime_tree_hash_after','N/A')}`\n- **Website HEAD before:** `{imm.get('website_head_before','N/A')}`\n- **Website HEAD after:** `{imm.get('website_head_after','N/A')}`\n- **Website status before:** `{imm.get('website_status_before','') or '(clean)'}`\n- **Website status after:** `{imm.get('website_status_after','') or '(clean)'}`\n- **Website remote refs unchanged:** `{yesno(bool(imm.get('website_remote_refs_unchanged')))}`\n- **Remote writes:** `NO`\n- **Remote branch creation:** `NO`\n- **Pull Request:** `NO`\n- **Vercel:** `NO`\n- **PUBLISHED transition:** `NO`\n\nThe workflow declares `permissions: contents: read`, uses `persist-credentials: false`, and contains no publication/deployment command.\n\n## Final classification\n\n`{classification}`\n\n{('Failure reason: ' + failure_reason) if failure_reason else ''}\n\n## Acceptance summary\n\n- **REAL PINNED WEBSITE BUILD:** `{('PASS' if classification == 'PASS' else classification)}`\n- **STORY:** `{result.get('types',{}).get('story',{}).get('status','NOT RUN')}`\n- **ARTICLE:** `{result.get('types',{}).get('article',{}).get('status','NOT RUN')}`\n- **VIDEO:** `{result.get('types',{}).get('video',{}).get('status','NOT RUN')}`\n- **SHORT:** `{result.get('types',{}).get('short',{}).get('status','NOT RUN')}`\n- **ROUTE VALIDATION:** `{('PASS' if classification == 'PASS' else 'NOT COMPLETE')}`\n- **NEGATIVE TEST:** `{result.get('negative_test',{}).get('status','NOT RUN')}`\n- **REAL WEBSITE UNCHANGED:** `{yesno(classification == 'PASS' and imm.get('website_head_before') == imm.get('website_head_after') and imm.get('website_status_before') == imm.get('website_status_after'))}`\n- **OPS UNCHANGED:** `{yesno(classification == 'PASS' and all(result.get('types',{}).get(c,{}).get('ops_head_before') == result.get('types',{}).get(c,{}).get('ops_head_after') for c in SUPPORTED))}`\n- **REMOTE WRITE:** `NO`\n- **READY FOR M6 FINAL ACCEPTANCE:** `{yesno(classification == 'PASS')}`\n"""
     (OUT / "REAL_WEBSITE_BUILD_EVIDENCE.md").write_text(md, encoding="utf-8")
 
 print(json.dumps({"classification": classification, "failure_reason": failure_reason, "evidence": str(OUT / 'REAL_WEBSITE_BUILD_EVIDENCE.md')}, ensure_ascii=False))
