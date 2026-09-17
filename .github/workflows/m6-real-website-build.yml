@@ -1,0 +1,114 @@
+name: M6 Real Website Build Evidence
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/m6-real-website-build.yml'
+      - 'evidence_runner/**'
+      - 'assets/runtime-small/**'
+
+permissions:
+  contents: read
+
+jobs:
+  m6-real-website-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout evidence repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Reconstruct exact accepted M6 runtime snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat assets/runtime-small/part-*.txt > /tmp/m6-runtime.b64
+          base64 --decode /tmp/m6-runtime.b64 > /tmp/m6-runtime.tar.gz
+          echo 'dad62570a8db918e205b571a0d994588b2e86ab49f1f746a6b4250a2e85cd0f6  /tmp/m6-runtime.tar.gz' | sha256sum -c -
+          mkdir -p m6
+          tar -xzf /tmp/m6-runtime.tar.gz -C m6
+          printf '%s\n' 'b02bd7743504ef135aed68656f26e84c90cf5af0' > m6/.accepted-head
+          printf '%s\n' 'dad62570a8db918e205b571a0d994588b2e86ab49f1f746a6b4250a2e85cd0f6' > m6/.runtime-archive-sha256
+          test -f m6/src/aqp_publisher/publisher.py
+          test -f m6/requirements.txt
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('m6/IMPLEMENTATION.json')
+          print(p.read_text(encoding='utf-8'))
+          PY
+
+      - name: Checkout pinned Website baseline read-only
+        uses: actions/checkout@v4
+        with:
+          repository: pitchu213-sys/ahla-qisas
+          ref: 98c72e343f35cca378436e8f764b235786c8a70d
+          path: website
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify Website SHA and record runtimes
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git -C website rev-parse HEAD)"
+          echo "Website HEAD: $actual"
+          test "$actual" = '98c72e343f35cca378436e8f764b235786c8a70d'
+          node --version
+          npm --version
+          git -C website status --porcelain
+
+      - name: Install M6 Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check -r m6/requirements.txt
+
+      - name: Run M6 real Website evidence harness
+        id: harness
+        shell: bash
+        run: |
+          set +e
+          PYTHONPATH="$GITHUB_WORKSPACE/m6/src:$GITHUB_WORKSPACE/m6" python evidence_runner/m6_runner_v2.py
+          rc=$?
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Upload M6 evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m6-real-website-build-evidence-${{ github.run_id }}
+          path: evidence-output/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce evidence classification
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f evidence-output/results.json
+          cat evidence-output/REAL_WEBSITE_BUILD_EVIDENCE.md
+          rc='${{ steps.harness.outputs.exit_code }}'
+          test "$rc" = '0'
+          python - <<'PY'
+          import json
+          r=json.load(open('evidence-output/results.json',encoding='utf-8'))
+          print('FINAL_CLASSIFICATION=' + r['classification'])
+          if r['classification'] != 'PASS':
+              raise SystemExit(1)
+          PY
