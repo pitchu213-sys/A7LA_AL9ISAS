@@ -1,3 +1,4 @@
+# Evidence-only workflow. M6 implementation remains pinned and read-only.
 name: M6 Real Website Build Evidence
 
 on:
@@ -46,10 +47,8 @@ jobs:
           test -f m6/src/aqp_publisher/publisher.py
           test -f m6/requirements.txt
           python - <<'PY'
-          import json
           from pathlib import Path
-          p=Path('m6/IMPLEMENTATION.json')
-          print(p.read_text(encoding='utf-8'))
+          print(Path('m6/IMPLEMENTATION.json').read_text(encoding='utf-8'))
           PY
 
       - name: Checkout pinned Website baseline read-only
