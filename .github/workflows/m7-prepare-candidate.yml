@@ -1,0 +1,114 @@
+name: M7 Prepare Real Candidate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/m7-prepare-candidate.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout evidence repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Reconstruct accepted M6 runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat assets/runtime-small/part-*.txt > /tmp/m6-runtime.b64
+          base64 --decode /tmp/m6-runtime.b64 > /tmp/m6-runtime.tar.gz
+          echo 'dad62570a8db918e205b571a0d994588b2e86ab49f1f746a6b4250a2e85cd0f6  /tmp/m6-runtime.tar.gz' | sha256sum -c -
+          mkdir -p m6
+          tar -xzf /tmp/m6-runtime.tar.gz -C m6
+          test -f m6/src/aqp_publisher/publisher.py
+          test -f m6/tests/test_m6_publisher_dry_run.py
+
+      - name: Checkout pinned Website baseline
+        uses: actions/checkout@v4
+        with:
+          repository: pitchu213-sys/ahla-qisas
+          ref: 98c72e343f35cca378436e8f764b235786c8a70d
+          path: website
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install M6 dependencies
+        run: python -m pip install --disable-pip-version-check -r m6/requirements.txt
+
+      - name: Generate exact validated M6 candidate plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p m7-candidate
+          PYTHONPATH="$GITHUB_WORKSPACE/m6/src:$GITHUB_WORKSPACE/m6" python - <<'PY'
+          import json, subprocess, tempfile
+          from pathlib import Path
+          from aqp_publisher.publisher import WebsiteBaseline, WebsitePublisherDryRunEngine
+          from tests.test_m6_publisher_dry_run import make_ops_repo
+          from tests.m3_helpers import current
+
+          root=Path.cwd(); site=root/'website'; out=root/'m7-candidate'
+          expected='98c72e343f35cca378436e8f764b235786c8a70d'
+          actual=subprocess.check_output(['git','rev-parse','HEAD'],cwd=site,text=True).strip()
+          assert actual==expected, (actual, expected)
+          ops, manifest = make_ops_repo(root/'synthetic-m7', 'story')
+          engine=WebsitePublisherDryRunEngine(ops, WebsiteBaseline(site,'pitchu213-sys/ahla-qisas',expected,'main'))
+          plan=engine.generate_plan(manifest['content_id'], expected_website_base_sha=expected)
+          dry=engine.apply_and_validate(plan, install_timeout_seconds=900, build_timeout_seconds=900)
+          validated=dry['validated_change_set']
+          assert dry['status']=='PASS'
+          assert dry['build']['status']=='PASS'
+          assert dry['route_validation']['status']=='PASS'
+          assert current(ops,manifest['content_id'])[1]['current_state']=='APPROVED_FOR_PUBLISH'
+          (out/'candidate-plan.json').write_text(json.dumps(validated,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          source_rel=manifest['source_files'][0]['source_artifact']['path']
+          source=subprocess.check_output(['git','show',f'HEAD:{source_rel}'],cwd=ops)
+          (out/'candidate-source.md').write_bytes(source)
+          ops_head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ops,text=True).strip()
+          (out/'ops-head.txt').write_text(ops_head+'\n',encoding='utf-8')
+          subprocess.run(['git','bundle','create',str(out/'synthetic-ops.bundle'),'--all'],cwd=ops,check=True)
+          summary={
+            'm6_head':'b02bd7743504ef135aed68656f26e84c90cf5af0',
+            'website_sha':expected,
+            'ops_head':ops_head,
+            'content_id':manifest['content_id'],
+            'content_version':manifest['content_version'],
+            'content_hash':manifest['content_hash'],
+            'manifest_hash':manifest['manifest_hash'],
+            'route':validated['route'],
+            'branch':validated['branch_payload']['intended_branch_name'],
+            'changed_files':validated['branch_payload']['intended_changed_files'],
+            'build_status':dry['build']['status'],
+            'route_status':dry['route_validation']['status'],
+          }
+          (out/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+          print(json.dumps(summary,indent=2))
+          PY
+
+      - name: Upload candidate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: m7-real-candidate-${{ github.run_id }}
+          path: m7-candidate/
+          if-no-files-found: error
+          retention-days: 30
