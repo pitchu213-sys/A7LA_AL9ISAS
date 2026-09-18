@@ -1,0 +1,55 @@
+name: M7 Validate Vercel Preview Route
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/m7-preview-validate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout evidence repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate preview URL and exact route
+        shell: bash
+        env:
+          PREVIEW_BASE: https://ahla-qisas-git-aqp-publishaqp-c-ffc904-pitchu213-7741s-projects.vercel.app
+          EXPECTED_ROUTE: /stories/m2-story
+        run: |
+          set -euo pipefail
+          mkdir -p m7-preview-evidence
+          url="${PREVIEW_BASE}${EXPECTED_ROUTE}"
+          code="$(curl --fail-with-body --location --silent --show-error --output m7-preview-evidence/body.html --write-out '%{http_code}' "$url")"
+          printf '%s\n' "$code" > m7-preview-evidence/http_status.txt
+          printf '%s\n' "$url" > m7-preview-evidence/preview_url.txt
+          test "$code" = "200"
+          grep -Fq 'Synthetic story' m7-preview-evidence/body.html
+          {
+            echo '# M7 Vercel Preview Route Evidence'
+            echo ''
+            echo "- Preview base: \`${PREVIEW_BASE}\`"
+            echo "- Expected route: \`${EXPECTED_ROUTE}\`"
+            echo "- HTTP status: \`${code}\`"
+            echo '- Exact content marker found: `Synthetic story`'
+            echo '- Classification: `PASS`'
+            echo '- Production authorization: `NO`'
+            echo '- PUBLISHED authorization: `NO`'
+          } > m7-preview-evidence/PREVIEW_ROUTE_EVIDENCE.md
+
+      - name: Upload preview evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: m7-preview-route-evidence-${{ github.run_id }}
+          path: m7-preview-evidence/
+          retention-days: 30
+          if-no-files-found: error
