@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 import os
 import subprocess
@@ -16,6 +15,7 @@ OUT.mkdir(parents=True, exist_ok=True)
 M6_HEAD = "b02bd7743504ef135aed68656f26e84c90cf5af0"
 WEBSITE_SHA = "98c72e343f35cca378436e8f764b235786c8a70d"
 WEBSITE_REPO = "pitchu213-sys/ahla-qisas"
+CONTENT_ID = "AQP-CONTENT-0199f134-4182-7b60-a873-a82b93770001"
 
 def git(cwd: Path, *args: str) -> str:
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
@@ -26,20 +26,24 @@ assert git(WEBSITE, "rev-parse", "HEAD") == WEBSITE_SHA
 import sys
 sys.path.insert(0, str(M6/"src"))
 sys.path.insert(0, str(M6))
-
-from tests.test_m6_publisher_dry_run import make_ops_repo
 from aqp_publisher.publisher import WebsiteBaseline, WebsitePublisherDryRunEngine, validate_publisher_eligibility
+from aqp_core.schema import load_json
 
 with tempfile.TemporaryDirectory(prefix="aqp-m7-synthetic-") as td:
     td = Path(td)
-    ops, manifest = make_ops_repo(td/"ops", "story")
+    bundle = td/"ops.bundle"
+    raw = subprocess.run(["base64","--decode",str(ROOT/"assets/m7-synthetic-ops.bundle.b64")], check=True, capture_output=True).stdout
+    bundle.write_bytes(raw)
+    ops = td/"ops"
+    subprocess.run(["git","clone","--quiet",str(bundle),str(ops)], check=True)
     ops_head = git(ops, "rev-parse", "HEAD")
+    manifest = load_json(ops/f"aqp/registry/content/{CONTENT_ID}/current.json")
     baseline = WebsiteBaseline(WEBSITE, WEBSITE_REPO, WEBSITE_SHA, "main")
     engine = WebsitePublisherDryRunEngine(ops, baseline)
-    eligibility = validate_publisher_eligibility(ops, manifest["content_id"])
+    eligibility = validate_publisher_eligibility(ops, CONTENT_ID)
     if not eligibility["eligible"]:
         raise SystemExit("synthetic package is not eligible")
-    plan = engine.generate_plan(manifest["content_id"], expected_website_base_sha=WEBSITE_SHA)
+    plan = engine.generate_plan(CONTENT_ID, expected_website_base_sha=WEBSITE_SHA)
     validated = engine.apply_and_validate(plan, build_timeout_seconds=900, install_timeout_seconds=900)["validated_change_set"]
 
     artifact_rel = manifest["source_files"][0]["source_artifact"]["path"]
