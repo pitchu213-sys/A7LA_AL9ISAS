@@ -20,36 +20,49 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Validate preview URL and exact route
+      - name: Probe preview URL and exact route
+        id: probe
         shell: bash
         env:
           PREVIEW_BASE: https://ahla-qisas-git-aqp-publishaqp-c-ffc904-pitchu213-7741s-projects.vercel.app
           EXPECTED_ROUTE: /stories/m2-story
         run: |
-          set -euo pipefail
+          set +e
           mkdir -p m7-preview-evidence
           url="${PREVIEW_BASE}${EXPECTED_ROUTE}"
-          code="$(curl --fail-with-body --location --silent --show-error --output m7-preview-evidence/body.html --write-out '%{http_code}' "$url")"
-          printf '%s\n' "$code" > m7-preview-evidence/http_status.txt
+          curl --location --silent --show-error --dump-header m7-preview-evidence/headers.txt --output m7-preview-evidence/body.html --write-out '%{http_code}' "$url" > m7-preview-evidence/http_status.txt
+          rc=$?
+          code="$(cat m7-preview-evidence/http_status.txt 2>/dev/null || true)"
           printf '%s\n' "$url" > m7-preview-evidence/preview_url.txt
-          test "$code" = "200"
-          grep -Fq 'Synthetic story' m7-preview-evidence/body.html
+          printf '%s\n' "$rc" > m7-preview-evidence/curl_exit.txt
+          echo "curl_exit=$rc" >> "$GITHUB_OUTPUT"
+          echo "http_status=$code" >> "$GITHUB_OUTPUT"
+          if grep -Fq 'Synthetic story' m7-preview-evidence/body.html 2>/dev/null; then marker=YES; else marker=NO; fi
+          echo "marker=$marker" >> "$GITHUB_OUTPUT"
           {
             echo '# M7 Vercel Preview Route Evidence'
             echo ''
             echo "- Preview base: \`${PREVIEW_BASE}\`"
             echo "- Expected route: \`${EXPECTED_ROUTE}\`"
+            echo "- curl exit: \`${rc}\`"
             echo "- HTTP status: \`${code}\`"
-            echo '- Exact content marker found: `Synthetic story`'
-            echo '- Classification: `PASS`'
-            echo '- Production authorization: `NO`'
-            echo '- PUBLISHED authorization: `NO`'
+            echo "- Exact content marker found: \`${marker}\`"
           } > m7-preview-evidence/PREVIEW_ROUTE_EVIDENCE.md
+          exit 0
 
       - name: Upload preview evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: m7-preview-route-evidence-${{ github.run_id }}
           path: m7-preview-evidence/
           retention-days: 30
           if-no-files-found: error
+
+      - name: Enforce preview validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test '${{ steps.probe.outputs.curl_exit }}' = '0'
+          test '${{ steps.probe.outputs.http_status }}' = '200'
+          test '${{ steps.probe.outputs.marker }}' = 'YES'
